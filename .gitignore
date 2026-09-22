@@ -1,0 +1,6 @@
+data/artwork/
+data/sprites/
+logs/
+__pycache__/
+*.pyc
+.DS_Store
