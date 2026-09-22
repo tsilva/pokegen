@@ -54,12 +54,35 @@ def get_args(argv=None):
     p.add_argument("--truncate", type=float, default=0.85, help="latent noise scale for preview samples")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default="auto", help="auto | mps | cuda | cpu")
+    p.add_argument("--amp", default="auto", choices=["auto", "off", "bf16", "fp16"],
+                   help="mixed precision; auto = bf16 on CUDA, off elsewhere")
+    p.add_argument("--channels-last", action="store_true", help="channels_last memory format (faster convs on CUDA)")
+    p.add_argument("--compile", action="store_true", help="torch.compile the model (CUDA first run pays compile time)")
     return p.parse_args(argv)
+
+
+def _setup_backend(device: torch.device):
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+
+
+def _amp_dtype(choice: str, device: torch.device):
+    if choice == "off":
+        return None
+    if choice == "auto":
+        return torch.bfloat16 if device.type == "cuda" else None
+    return torch.bfloat16 if choice == "bf16" else torch.float16
 
 
 def main(argv=None):
     args = get_args(argv)
     device = pick_device(args.device)
+    _setup_backend(device)
+    amp_dtype = _amp_dtype(args.amp, device)
+    scaler = torch.amp.GradScaler(device.type, enabled=amp_dtype == torch.float16)
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -70,22 +93,36 @@ def main(argv=None):
     print(f"{n} images from {args.data} | cache {args.cache_pad}px -> crop {args.img_size}px | device {device}")
 
     model = VAE(args.img_size, args.base_channels, args.latent_dim).to(device)
+    if args.channels_last:
+        model = model.to(memory_format=torch.channels_last)
     params = sum(p.numel() for p in model.parameters())
     print(f"VAE with {params / 1e6:.2f}M params, latent dim {args.latent_dim}")
+    if amp_dtype is not None:
+        print(f"amp: {str(amp_dtype).replace('torch.', '')}")
+    if args.channels_last:
+        print("channels_last enabled")
 
     perceptual = PerceptualLoss().to(device).eval() if args.perceptual_weight > 0 else None
     if perceptual is not None:
+        if args.channels_last:
+            perceptual = perceptual.to(memory_format=torch.channels_last)
         print(f"perceptual loss: VGG16 relu2_2+relu3_3 @ {perceptual.size}px, weight {args.perceptual_weight}")
+
+    if args.compile:
+        model = torch.compile(model)
+        print("torch.compile enabled (first steps are slow)")
+    raw_model = getattr(model, "_orig_mod", model)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=args.min_lr)
     steps = max(1, math.ceil(n / args.batch_size))
+    amp_ctx = lambda: torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None)
 
     def sample(epoch, size):
-        stats = latent_stats(model, images, size)
+        stats = latent_stats(raw_model, images, size)
         eps = torch.randn(args.sample_count, args.latent_dim, generator=gen)
         z = torch.tensor(stats["mean"]) + torch.tensor(stats["std"]) * args.truncate * eps
-        save_grid(model.decode(z.to(device), size=size), args.sample_dir / f"epoch-{epoch:04d}.png", nrow=6)
+        save_grid(raw_model.decode(z.to(device), size=size), args.sample_dir / f"epoch-{epoch:04d}.png", nrow=6)
         print(f"  wrote {args.sample_dir / f'epoch-{epoch:04d}.png'}")
 
     t0 = time.time()
@@ -98,21 +135,26 @@ def main(argv=None):
         model.train()
         for b in range(steps):
             idx = order[b * args.batch_size:(b + 1) * args.batch_size]
-            x = augment(images[idx], size, args.jitter, gen).to(device)
-            xhat, mu, logvar = model(x)
-            mse = F.mse_loss(xhat, x, reduction="sum") / x.shape[0]
-            l1 = F.l1_loss(xhat, x, reduction="sum") / x.shape[0]
-            recon = mse + args.l1_weight * l1
-            if perceptual is not None:
-                perc = perceptual(xhat, x)
-                recon = recon + args.perceptual_weight * perc
-                perc_sum += perc.item()
-            kl = kl_per_sample(mu, logvar, args.free_bits)
-            loss = recon + beta * kl
+            x = augment(images[idx], size, args.jitter, gen).to(device, non_blocking=True)
+            if args.channels_last:
+                x = x.contiguous(memory_format=torch.channels_last)
+            with amp_ctx():
+                xhat, mu, logvar = model(x)
+                mse = F.mse_loss(xhat.float(), x.float(), reduction="sum") / x.shape[0]
+                l1 = F.l1_loss(xhat.float(), x.float(), reduction="sum") / x.shape[0]
+                recon = mse + args.l1_weight * l1
+                if perceptual is not None:
+                    perc = perceptual(xhat, x)
+                    recon = recon + args.perceptual_weight * perc
+                    perc_sum += perc.item()
+                kl = kl_per_sample(mu.float(), logvar.float(), args.free_bits)
+                loss = recon + beta * kl
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
             recon_sum += mse.item()
             l1_sum += l1.item()
             kl_sum += kl.item()
@@ -128,9 +170,9 @@ def main(argv=None):
         if epoch == 1 or epoch % args.sample_every == 0 or epoch == args.epochs:
             sample(epoch, size)
 
-    save_full_checkpoint(args.out / "vae.pt", model)
-    stats = latent_stats(model, images, args.img_size)
-    save_decoder_checkpoint(args.out / "decoder.pt", model, stats)
+    save_full_checkpoint(args.out / "vae.pt", raw_model)
+    stats = latent_stats(raw_model, images, args.img_size)
+    save_decoder_checkpoint(args.out / "decoder.pt", raw_model, stats)
     use = sum(1 for s in stats["std"] if s > 0.2)
     print(f"aggregate posterior: {use}/{args.latent_dim} dims active (std > 0.2)")
     print(f"saved {args.out / 'vae.pt'} and {args.out / 'decoder.pt'} ({time.time() - t0:.0f}s total)")
