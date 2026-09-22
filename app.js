@@ -45,7 +45,10 @@ const state = {
   sort: "id-asc",
   view: "artwork",
   index: -1,
+  generated: null,
 };
+
+const GEN_COMMAND = "python3 sample.py --n 64";
 
 const $ = (sel) => document.querySelector(sel);
 const grid = $("#grid");
@@ -119,10 +122,13 @@ async function init() {
 
   $("#clear").addEventListener("click", clearFilters);
   $("#random").addEventListener("click", openRandom);
+  $("#regen").addEventListener("click", copyGenCommand);
 
   grid.addEventListener("click", (e) => {
     const card = e.target.closest(".card");
-    if (card) openDetail(Number(card.dataset.index));
+    if (!card) return;
+    if (state.view === "generated") return openGeneratedDetail(Number(card.dataset.index));
+    openDetail(Number(card.dataset.index));
   });
 
   document.addEventListener("keydown", onKeydown);
@@ -152,13 +158,51 @@ function clearFilters() {
   applyFilters();
 }
 
-function setView(view) {
+async function setView(view) {
   state.view = view;
   document.querySelectorAll("#viewtoggle button").forEach((b) =>
     b.classList.toggle("active", b.dataset.view === view)
   );
-  renderGrid();
-  if (state.index >= 0) renderDetail(state.filtered[state.index]);
+  $("#regen").hidden = view !== "generated";
+  $("#types").hidden = view === "generated";
+  if (view === "generated") {
+    await loadGenerated();
+    renderGrid();
+  } else {
+    applyFilters();
+  }
+  if (state.index < 0) return;
+  const items = generatedItems();
+  if (view === "generated") {
+    items.length ? openGeneratedDetail(Math.min(state.index, items.length - 1)) : closeDetail();
+  } else if (state.filtered[state.index]) {
+    renderDetail(state.filtered[state.index]);
+  } else {
+    closeDetail();
+  }
+}
+
+async function loadGenerated() {
+  try {
+    const res = await fetch("data/generated/manifest.json", { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    state.generated = await res.json();
+  } catch {
+    state.generated = null;
+  }
+}
+
+const generatedItems = () => state.generated?.items || [];
+
+async function copyGenCommand() {
+  const btn = $("#regen");
+  try {
+    await navigator.clipboard.writeText(GEN_COMMAND);
+    btn.textContent = "Copied!";
+  } catch {
+    btn.textContent = GEN_COMMAND;
+  }
+  setTimeout(() => (btn.textContent = "Copy generate command"), 1500);
 }
 
 function matches(p, gen) {
@@ -183,6 +227,8 @@ function applyFilters() {
 }
 
 function renderGrid() {
+  if (state.view === "generated") return renderGenerated();
+  $("#empty").textContent = "No Pokémon match your filters.";
   const frag = document.createDocumentFragment();
   for (const [i, p] of state.filtered.entries()) {
     const card = document.createElement("button");
@@ -203,6 +249,68 @@ function renderGrid() {
   grid.replaceChildren(frag);
   $("#count").textContent = `${state.filtered.length} / ${state.all.length}`;
   $("#empty").hidden = state.filtered.length > 0;
+}
+
+function renderGenerated() {
+  const items = generatedItems();
+  const frag = document.createDocumentFragment();
+  for (const [i, item] of items.entries()) {
+    const card = document.createElement("button");
+    card.className = "card";
+    card.dataset.index = i;
+    card.dataset.generated = "1";
+    card.style.setProperty("--c", "#8b5cf6");
+    card.innerHTML = `
+      <span class="dex">#${String(i + 1).padStart(3, "0")}</span>
+      <img loading="lazy" decoding="async" src="data/generated/${esc(item.file)}"
+           alt="Generated Pokémon ${i + 1}">
+      <span class="name">Unnamed Species</span>
+      <span class="badges"><span class="badge" style="background:#8b5cf6">generated</span></span>`;
+    frag.append(card);
+  }
+  grid.replaceChildren(frag);
+  const created = state.generated?.created ? ` · ${state.generated.created.slice(0, 10)}` : "";
+  $("#count").textContent = `${items.length} generated${created}`;
+  $("#empty").hidden = items.length > 0;
+  $("#empty").textContent = `No generated Pokémon yet. Run "${GEN_COMMAND}", then reload this page.`;
+}
+
+function renderGeneratedDetail(item, i) {
+  detail.style.setProperty("--c", "#8b5cf6");
+  detail.innerHTML = `
+    <button class="close" data-close aria-label="Close">×</button>
+    <button class="nav prev" data-action="prev" aria-label="Previous">‹</button>
+    <button class="nav next" data-action="next" aria-label="Next">›</button>
+    <div class="detail-art">
+      <img src="data/generated/${esc(item.file)}" alt="Generated Pokémon ${i + 1}">
+    </div>
+    <div class="detail-info">
+      <div class="detail-head">
+        <span class="dex">#${String(i + 1).padStart(3, "0")}</span>
+        <h2>Unnamed Species</h2>
+      </div>
+      <div class="badges"><span class="badge" style="background:#8b5cf6">generated</span></div>
+      <div class="facts">
+        <span>Source <b>${esc(state.generated?.mode || "noise z ~ N(0, I)")}</b></span>
+        <span>From <b>${esc(state.generated?.checkpoint || "decoder.pt")}</b></span>
+        <span>Seed <b>${state.generated?.seed ?? "?"}</b></span>
+      </div>
+      <div class="detail-actions">
+        <button data-action="next" class="ghost">Next ›</button>
+      </div>
+      <div class="kbd-hint">← → to browse · Esc to close</div>
+    </div>`;
+}
+
+function openGeneratedDetail(index) {
+  const items = generatedItems();
+  const item = items[index];
+  if (!item) return;
+  state.index = index;
+  renderGeneratedDetail(item, index);
+  modal.hidden = false;
+  document.body.style.overflow = "hidden";
+  detail.querySelector(".close").focus({ preventScroll: true });
 }
 
 function statRow([key, label], value) {
@@ -289,12 +397,23 @@ function closeDetail() {
 }
 
 function step(delta) {
-  if (state.index < 0 || !state.filtered.length) return;
+  if (state.index < 0) return;
+  if (state.view === "generated") {
+    const items = generatedItems();
+    if (!items.length) return;
+    return openGeneratedDetail((state.index + delta + items.length) % items.length);
+  }
+  if (!state.filtered.length) return;
   const next = (state.index + delta + state.filtered.length) % state.filtered.length;
   openDetail(next);
 }
 
 function openRandom() {
+  if (state.view === "generated") {
+    const items = generatedItems();
+    if (items.length) openGeneratedDetail(Math.floor(Math.random() * items.length));
+    return;
+  }
   const pool = state.filtered.length ? state.filtered : state.all;
   const p = pool[Math.floor(Math.random() * pool.length)];
   const idx = state.filtered.indexOf(p);

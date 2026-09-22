@@ -1,5 +1,8 @@
 data/artwork/
 data/sprites/
+data/cache/
+data/generated/
+checkpoints/
 logs/
 __pycache__/
 *.pyc
