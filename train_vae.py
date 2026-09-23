@@ -42,9 +42,12 @@ def get_args(argv=None):
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--latent-dim", type=int, default=256)
     p.add_argument("--base-channels", type=int, default=32)
+    p.add_argument("--depth", type=int, default=1, help="conv layers per encoder/decoder block")
     p.add_argument("--l1-weight", type=float, default=1.0, help="L1 term added to summed MSE; sharpens edges")
     p.add_argument("--perceptual-weight", type=float, default=0.02,
                    help="weight on VGG16 feature L1 (per-image sum); 0 disables")
+    p.add_argument("--perceptual-size", type=int, default=0,
+                   help="VGG input resolution; 0 = native (finer guidance), smaller is faster")
     p.add_argument("--beta", type=float, default=0.5, help="final KL weight (recon is per-pixel squared error summed)")
     p.add_argument("--warmup-epochs", type=int, default=10, help="ramp beta 0 -> beta over this many epochs")
     p.add_argument("--free-bits", type=float, default=0.1, help="per-dim KL floor (nats); 0 disables")
@@ -92,7 +95,7 @@ def main(argv=None):
     n = images.shape[0]
     print(f"{n} images from {args.data} | cache {args.cache_pad}px -> crop {args.img_size}px | device {device}")
 
-    model = VAE(args.img_size, args.base_channels, args.latent_dim).to(device)
+    model = VAE(args.img_size, args.base_channels, args.latent_dim, args.depth).to(device)
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
     params = sum(p.numel() for p in model.parameters())
@@ -102,11 +105,12 @@ def main(argv=None):
     if args.channels_last:
         print("channels_last enabled")
 
-    perceptual = PerceptualLoss().to(device).eval() if args.perceptual_weight > 0 else None
+    perceptual = PerceptualLoss(size=args.perceptual_size).to(device).eval() if args.perceptual_weight > 0 else None
     if perceptual is not None:
         if args.channels_last:
             perceptual = perceptual.to(memory_format=torch.channels_last)
-        print(f"perceptual loss: VGG16 relu2_2+relu3_3 @ {perceptual.size}px, weight {args.perceptual_weight}")
+        where = f"{perceptual.size}px" if perceptual.size else "native"
+        print(f"perceptual loss: VGG16 relu2_2+relu3_3 @ {where}, weight {args.perceptual_weight}")
 
     if args.compile:
         model = torch.compile(model)

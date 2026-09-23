@@ -89,15 +89,16 @@ def augment(batch: torch.Tensor, crop: int, jitter: float, gen: torch.Generator)
     return x
 
 
-def _block(cin: int, cout: int, up: bool = False):
+def _block(cin: int, cout: int, up: bool = False, depth: int = 1):
     layers = []
     if up:
         layers.append(nn.Upsample(scale_factor=2, mode="nearest"))
-    layers += [
-        nn.Conv2d(cin, cout, 3, stride=1 if up else 2, padding=1),
-        nn.GroupNorm(GROUPS, cout),
-        nn.SiLU(),
-    ]
+    for i in range(depth):
+        layers += [
+            nn.Conv2d(cin if i == 0 else cout, cout, 3, stride=1 if (up or i > 0) else 2, padding=1),
+            nn.GroupNorm(GROUPS, cout),
+            nn.SiLU(),
+        ]
     return layers
 
 
@@ -107,14 +108,14 @@ def _channels(base: int, stages: int):
 
 
 class Encoder(nn.Module):
-    def __init__(self, img_size: int = 64, base_channels: int = 32, latent_dim: int = 128):
+    def __init__(self, img_size: int = 64, base_channels: int = 32, latent_dim: int = 128, depth: int = 1):
         super().__init__()
         stages = int(math.log2(img_size)) - 2
         channels = _channels(base_channels, stages)
         blocks = []
         cin = 3
         for cout in channels:
-            blocks.append(nn.Sequential(*_block(cin, cout)))
+            blocks.append(nn.Sequential(*_block(cin, cout, depth=depth)))
             cin = cout
         self.blocks = nn.ModuleList(blocks)
         self.mu = nn.Linear(channels[-1] * 16, latent_dim)
@@ -130,7 +131,7 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, img_size: int = 64, base_channels: int = 32, latent_dim: int = 128):
+    def __init__(self, img_size: int = 64, base_channels: int = 32, latent_dim: int = 128, depth: int = 1):
         super().__init__()
         stages = int(math.log2(img_size)) - 2
         top = _channels(base_channels, stages)[-1]
@@ -140,7 +141,7 @@ class Decoder(nn.Module):
         blocks = []
         cin, width, res = top, top, 4
         while res < img_size:
-            blocks.append(nn.Sequential(*_block(cin, width, up=True)))
+            blocks.append(nn.Sequential(*_block(cin, width, up=True, depth=depth)))
             cin, res = width, res * 2
             width = max(base_channels, width // 2)
         self.blocks = nn.ModuleList(blocks)
@@ -155,9 +156,9 @@ class Decoder(nn.Module):
 
 
 class VAE(nn.Module):
-    def __init__(self, img_size: int = 64, base_channels: int = 32, latent_dim: int = 128):
+    def __init__(self, img_size: int = 64, base_channels: int = 32, latent_dim: int = 128, depth: int = 1):
         super().__init__()
-        self.config = dict(img_size=img_size, base_channels=base_channels, latent_dim=latent_dim)
+        self.config = dict(img_size=img_size, base_channels=base_channels, latent_dim=latent_dim, depth=depth)
         self.encoder = Encoder(**self.config)
         self.decoder = Decoder(**self.config)
 
@@ -181,9 +182,13 @@ def kl_per_sample(mu: torch.Tensor, logvar: torch.Tensor, free_bits: float = 0.0
 
 
 class PerceptualLoss(nn.Module):
-    """VGG16 feature L1; targets the structure a pixel loss averages away. Compares at 64px for speed."""
+    """VGG16 feature L1; targets the structure a pixel loss averages away.
 
-    def __init__(self, layers=(8, 15), size: int = 64):
+    size=0 compares at the native resolution (needed to guide detail); a smaller
+    size is cheaper but blind to detail above that resolution.
+    """
+
+    def __init__(self, layers=(8, 15), size: int = 0):
         super().__init__()
         import torchvision
 
@@ -192,12 +197,14 @@ class PerceptualLoss(nn.Module):
         for p in self.slice.parameters():
             p.requires_grad_(False)
         self.layers = set(layers)
-        self.size = size
+        self.size = size or None
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
     def _prep(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.interpolate((x + 1) / 2, size=self.size, mode="bilinear", align_corners=False)
+        x = (x + 1) / 2
+        if self.size is not None:
+            x = F.interpolate(x, size=self.size, mode="bilinear", align_corners=False)
         return (x - self.mean) / self.std
 
     def forward(self, x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
