@@ -56,11 +56,17 @@ def get_args(argv=None):
 
 
 class Discriminator(nn.Module):
-    """PatchGAN critic: 128px in -> 8x8 patch logits, spectral-normalized."""
+    """PatchGAN critic with coordinate channels: 128px in -> 8x8 patch logits.
+
+    Images are mostly white background, so without position info the critic scores
+    background-colored patches as real wherever they appear and the decoder paints
+    white holes inside subjects. Coordinates let it learn "background is only real
+    near the border".
+    """
 
     def __init__(self, base: int = 64):
         super().__init__()
-        widths = [3, base, base * 2, base * 4, base * 8]
+        widths = [5, base, base * 2, base * 4, base * 8]
         layers = []
         for cin, cout in zip(widths, widths[1:]):
             layers += [spectral_norm(nn.Conv2d(cin, cout, 4, stride=2, padding=1)), nn.LeakyReLU(0.2, inplace=True)]
@@ -68,10 +74,13 @@ class Discriminator(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        n, _, h, w = x.shape
+        ys = torch.linspace(-1, 1, h, device=x.device).view(1, 1, h, 1).expand(n, 1, h, w)
+        xs = torch.linspace(-1, 1, w, device=x.device).view(1, 1, 1, w).expand(n, 1, h, w)
+        return self.net(torch.cat([x, ys.to(x.dtype), xs.to(x.dtype)], dim=1))
 
 
-def diff_augment(x: torch.Tensor, jitter: float = 0.1, max_shift: int = 6, cutout: bool = True) -> torch.Tensor:
+def diff_augment(x: torch.Tensor, jitter: float = 0.1, max_shift: int = 6) -> torch.Tensor:
     """Differentiable, identical-in-kind augmentation for real and fake critic inputs."""
     if random.random() < 0.5:
         x = torch.flip(x, dims=[3])
@@ -89,13 +98,6 @@ def diff_augment(x: torch.Tensor, jitter: float = 0.1, max_shift: int = 6, cutou
         h, w = x.shape[-2:]
         x = F.pad(x, (max_shift, max_shift, max_shift, max_shift), value=1.0)
         x = x[:, :, max_shift + dy:max_shift + dy + h, max_shift + dx:max_shift + dx + w]
-    if cutout and random.random() < 0.3:
-        h, w = x.shape[-2:]
-        size = h // 8
-        top = int(torch.randint(0, h - size + 1, (1,)))
-        left = int(torch.randint(0, w - size + 1, (1,)))
-        x = x.clone()
-        x[:, :, top:top + size, left:left + size] = 1.0
     return x.clamp(-1, 1)
 
 
