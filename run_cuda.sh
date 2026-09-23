@@ -10,7 +10,7 @@ exec .venv/bin/python -u train_vae.py "$@" \
   --batch-size 256 \
   --lr 8e-4 \
   --beta 0.3 \
-  --perceptual-weight 0.02 \
+  --perceptual-weight 0.04 \
   --channels-last \
   --sample-every 50 \
   --sample-count 36

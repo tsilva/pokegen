@@ -44,8 +44,9 @@ def get_args(argv=None):
     p.add_argument("--base-channels", type=int, default=32)
     p.add_argument("--depth", type=int, default=1, help="conv layers per encoder/decoder block")
     p.add_argument("--l1-weight", type=float, default=1.0, help="L1 term added to summed MSE; sharpens edges")
-    p.add_argument("--perceptual-weight", type=float, default=0.02,
-                   help="weight on VGG16 feature L1 (per-image sum); 0 disables")
+    p.add_argument("--perceptual-weight", type=float, default=0.04,
+                   help="VGG feature L1 as a fraction of the pixel-loss scale; 0 disables. "
+                        "~0.25 of the pixel-loss scale keeps color while nudging structure")
     p.add_argument("--perceptual-size", type=int, default=0,
                    help="VGG input resolution; 0 = native (finer guidance), smaller is faster")
     p.add_argument("--beta", type=float, default=0.5, help="final KL weight (recon is per-pixel squared error summed)")
@@ -149,7 +150,7 @@ def main(argv=None):
                 recon = mse + args.l1_weight * l1
                 if perceptual is not None:
                     perc = perceptual(xhat, x)
-                    recon = recon + args.perceptual_weight * perc
+                    recon = recon + args.perceptual_weight * perc * (3 * x.shape[-1] * x.shape[-2])
                     perc_sum += perc.item()
                 kl = kl_per_sample(mu.float(), logvar.float(), args.free_bits)
                 loss = recon + beta * kl

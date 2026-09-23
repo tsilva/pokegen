@@ -208,12 +208,13 @@ class PerceptualLoss(nn.Module):
         return (x - self.mean) / self.std
 
     def forward(self, x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Mean L1 in VGG feature space (unitless); scale by pixel count to compare with pixel losses."""
         x, target = self._prep(x), self._prep(target)
         total = x.new_zeros(())
         for i, layer in enumerate(self.slice):
             x, target = layer(x), layer(target)
             if i in self.layers:
-                total = total + F.l1_loss(x, target, reduction="sum") / x.shape[0]
+                total = total + F.l1_loss(x, target)
         return total
 
 
