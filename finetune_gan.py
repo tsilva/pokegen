@@ -71,7 +71,7 @@ class Discriminator(nn.Module):
         return self.net(x)
 
 
-def diff_augment(x: torch.Tensor, jitter: float = 0.1, max_shift: int = 6) -> torch.Tensor:
+def diff_augment(x: torch.Tensor, jitter: float = 0.1, max_shift: int = 6, cutout: bool = True) -> torch.Tensor:
     """Differentiable, identical-in-kind augmentation for real and fake critic inputs."""
     if random.random() < 0.5:
         x = torch.flip(x, dims=[3])
@@ -89,6 +89,13 @@ def diff_augment(x: torch.Tensor, jitter: float = 0.1, max_shift: int = 6) -> to
         h, w = x.shape[-2:]
         x = F.pad(x, (max_shift, max_shift, max_shift, max_shift), value=1.0)
         x = x[:, :, max_shift + dy:max_shift + dy + h, max_shift + dx:max_shift + dx + w]
+    if cutout and random.random() < 0.3:
+        h, w = x.shape[-2:]
+        size = h // 8
+        top = int(torch.randint(0, h - size + 1, (1,)))
+        left = int(torch.randint(0, w - size + 1, (1,)))
+        x = x.clone()
+        x[:, :, top:top + size, left:left + size] = 1.0
     return x.clamp(-1, 1)
 
 
